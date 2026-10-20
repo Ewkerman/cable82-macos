@@ -1,0 +1,1238 @@
+/* cable-82 control room. Reads and writes config.json through /api/config.
+   Validation is the server's job (shared config-schema.js); this page just
+   gathers a clean config object and shows what came back. No dependencies. */
+(() => {
+  "use strict";
+
+  const S = window.Cable82Schema || {};
+  const PALETTE = S.PALETTE || {};
+  // The names offered in color pickers and the page cycle, in display order.
+  const COLOR_NAMES = ["blue", "cyan", "green", "yellow", "red", "magenta", "white", "ink"];
+  const ROTATION_TYPES = [
+    ["clock", "Clock"],
+    ["messages", "Messages"],
+    ["facts", "Facts"],
+    ["dadjokes", "Dad jokes"],
+    ["weather", "Weather"],
+    ["headlines", "Headlines"],
+  ];
+
+  // Working copy of the arrays the user edits row by row. Scalars are read
+  // straight from their inputs at save time; these three need their own state.
+  let feeds = [];
+  let rotation = [];
+  let messages = [];
+  let crawlFeeds = [];
+  let pageCycle = [];
+  let channels = []; // the dial, edited row by row like the lists above
+  let channelFolders = []; // [{folder, files, seconds, probed}] from /api/channels
+  let wxLocation = null; // { name, latitude, longitude, timezone } or null
+  let bootVersion = null;
+
+  const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+  const DAY_LABELS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+  const CHANNEL_TYPE_OPTIONS = [
+    ["bulletin", "Bulletin board"],
+    ["video", "Video folder"],
+    ["guide", "Guide (what is on)"],
+    ["external", "External page"],
+  ];
+  const OFFAIR_OPTIONS = [
+    ["testcard", "Test card"],
+    ["bars", "Color bars"],
+    ["snow", "Static"],
+    ["bulletin", "Bulletin board"],
+  ];
+
+  // Textareas hold one item per line; split/join at the config boundary.
+  const linesToArray = (text) => text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+  // ---------------------------------------------------------- tiny DOM helpers
+
+  const $ = (id) => document.getElementById(id);
+  const FAUX_SLIDERS = ["curve", "scanlines", "noise", "wave", "bloom", "vignette", "flicker"];
+
+  function el(tag, props, children) {
+    const n = document.createElement(tag);
+    if (props) {
+      for (const k in props) {
+        if (k === "class") n.className = props[k];
+        else if (k === "text") n.textContent = props[k];
+        else if (k === "html") n.innerHTML = props[k];
+        else if (k.startsWith("on") && typeof props[k] === "function") n.addEventListener(k.slice(2), props[k]);
+        else if (props[k] != null) n.setAttribute(k, props[k]);
+      }
+    }
+    for (const c of [].concat(children || [])) {
+      if (c == null) continue;
+      n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+    return n;
+  }
+
+  function option(value, label, selected) {
+    const o = el("option", { value }, label);
+    if (selected) o.selected = true;
+    return o;
+  }
+
+  // ---------------------------------------------------------- render: feeds
+
+  function renderFeeds() {
+    const host = $("feeds");
+    host.innerHTML = "";
+    if (!feeds.length) {
+      host.appendChild(el("div", { class: "empty" }, "No feeds yet. Add one to put headlines on the air."));
+    }
+    feeds.forEach((f, i) => {
+      host.appendChild(
+        el("div", { class: "item feed-item" }, [
+          el("input", {
+            type: "text", class: "mono", value: f.id, placeholder: "id",
+            "aria-label": "Feed id",
+            oninput: (e) => { f.id = e.target.value; },
+            onchange: () => { syncFeedDependents(); },
+          }),
+          el("input", {
+            type: "text", value: f.label, placeholder: "LABEL",
+            "aria-label": "Feed label",
+            oninput: (e) => { f.label = e.target.value; },
+          }),
+          el("input", {
+            type: "url", class: "mono", value: f.url, placeholder: "https://example.com/feed",
+            "aria-label": "Feed URL",
+            oninput: (e) => { f.url = e.target.value; },
+          }),
+          el("div", { class: "row-actions" }, [
+            el("button", {
+              type: "button", class: "icon danger", title: "Remove feed", "aria-label": "Remove feed",
+              onclick: () => { feeds.splice(i, 1); renderFeeds(); syncFeedDependents(); },
+            }, "✕"),
+          ]),
+        ])
+      );
+    });
+  }
+
+  // Rotation feed selects and crawl-feed chips reference feed ids, so rebuild
+  // them whenever the feed list or an id changes.
+  function syncFeedDependents() {
+    const ids = new Set(feeds.map((f) => f.id).filter(Boolean));
+    rotation.forEach((slot) => {
+      if (slot.type === "headlines" && !ids.has(slot.feed)) slot.feed = feeds[0] ? feeds[0].id : "";
+    });
+    crawlFeeds = crawlFeeds.filter((id) => ids.has(id));
+    renderRotation();
+    renderCrawlFeeds();
+  }
+
+  // ---------------------------------------------------------- render: channels
+
+  const TITLE_OPTIONS = [
+    ["filename", "Guide shows the file names"],
+    ["metadata", "Guide shows the titles inside the files"],
+    ["fixed", "Guide shows one name:"],
+  ];
+
+  function folderLabel(f) {
+    const mins = Math.round(f.seconds / 60);
+    const count = f.files === 1 ? "1 file" : f.files + " files";
+    const dur = f.probed < f.files ? count : count + ", " + (mins >= 60 ? Math.floor(mins / 60) + "h " + (mins % 60) + "m" : mins + "m");
+    // A folder on a plugged-in drive says so: the same name can mean a
+    // different library once the drive is unplugged.
+    const where = f.volume ? ", on " + f.volume : "";
+    return f.folder + "  (" + dur + where + ")";
+  }
+
+  function renderChannels() {
+    const host = $("channelList");
+    host.innerHTML = "";
+    if (!channels.length) {
+      host.appendChild(el("div", { class: "empty" }, "No channels: the board runs alone as channel 82. Add one to grow the dial."));
+    }
+    // The number IS the order, so rows sort themselves and need no arrows.
+    channels.sort((a, b) => (a.number || 0) - (b.number || 0));
+    channels.forEach((ch, i) => {
+      const head = el("div", { class: "ch-head" }, [
+        el("input", {
+          class: "ch-number", type: "number", min: 0, max: 999, value: ch.number != null ? ch.number : "",
+          "aria-label": "Channel number", placeholder: "82",
+          // An empty field must stay empty: Number("") is 0, and 0 is the
+          // guide's channel, so a cleared box would claim it.
+          onchange: (e) => { const v = e.target.value.trim(); ch.number = v === "" ? null : Number(v); renderChannels(); },
+        }),
+        el("input", {
+          class: "ch-name", type: "text", maxlength: 40, value: ch.name || "",
+          "aria-label": "Channel name", placeholder: ch.type === "bulletin" ? "CABLE 82" : "CHANNEL NAME",
+          onchange: (e) => { ch.name = e.target.value; },
+        }),
+        el("select", {
+          "aria-label": "Channel type",
+          onchange: (e) => { ch.type = e.target.value; renderChannels(); },
+        }, CHANNEL_TYPE_OPTIONS.map(([v, label]) => option(v, label, v === ch.type))),
+        el("label", { class: "toggle" }, [
+          (() => { const c = el("input", { type: "checkbox", "aria-label": "Channel enabled" }); c.checked = ch.enabled !== false; c.addEventListener("change", () => { ch.enabled = c.checked; }); return c; })(),
+          " on the dial",
+        ]),
+        el("div", { class: "row-actions" }, [
+          el("button", { type: "button", class: "icon danger", title: "Remove channel", "aria-label": "Remove channel",
+            onclick: () => { channels.splice(i, 1); renderChannels(); } }, "✕"),
+        ]),
+      ]);
+
+      const body = el("div", { class: "ch-body" });
+      if (ch.type === "bulletin") {
+        body.appendChild(el("span", { class: "note" }, "Shows the board: the page rotation below is this channel's lineup."));
+      } else if (ch.type === "guide") {
+        // Nothing to set on the row: the guide has its own group in the room.
+      } else if (ch.type === "external") {
+        body.appendChild(el("input", {
+          type: "url", style: "flex:1;min-width:14em", value: ch.url || "", placeholder: "http://localhost:8080/  (ws4kp)",
+          "aria-label": "External URL",
+          onchange: (e) => { ch.url = e.target.value; },
+        }));
+      } else {
+        // video: scheduling mode first. Block programming has no main folder:
+        // each block is its own programming source. Always-on and Scheduled
+        // hours keep the traditional single-folder picker.
+        body.appendChild(el("select", {
+          "aria-label": "Scheduling",
+          onchange: (e) => { ch.mode = e.target.value; renderChannels(); },
+        }, [option("continuous", "Always on the air", ch.mode === "continuous" || !ch.mode), option("blocks", "Block programming", ch.mode === "blocks"), option("schedule", "Scheduled hours", ch.mode === "schedule")]));
+        if (ch.mode !== "blocks") {
+          const known = channelFolders.some((f) => f.folder === ch.folder);
+          body.appendChild(el("select", {
+            "aria-label": "Video folder",
+            onchange: (e) => { ch.folder = e.target.value; renderChannels(); },
+          }, [
+            ...(!ch.folder ? [option("", "(pick a folder under channels/)", true)] : []),
+            ...(ch.folder && !known ? [option(ch.folder, ch.folder + "  (folder missing!)", true)] : []),
+            ...channelFolders.map((f) => option(f.folder, folderLabel(f), f.folder === ch.folder)),
+          ]));
+        }
+        if (ch.mode !== "blocks") {
+          body.appendChild(el("select", {
+            "aria-label": "Playback order",
+            onchange: (e) => { ch.order = e.target.value; },
+          }, [option("sequence", "In order", ch.order !== "shuffle-daily"), option("shuffle-daily", "Shuffled daily", ch.order === "shuffle-daily")]));
+        }
+        if (ch.mode === "schedule" || ch.mode === "blocks") {
+          body.appendChild(el("select", {
+            "aria-label": "Off-air look",
+            onchange: (e) => { ch.offAir = e.target.value; },
+          }, OFFAIR_OPTIONS.map(([v, label]) => option(v, (ch.mode === "blocks" ? "When no block: " : "Off air: ") + label, v === (ch.offAir || "testcard")))));
+        }
+        // What the guide calls this channel's programs.
+        body.appendChild(el("select", {
+          "aria-label": "Program titles in the guide",
+          onchange: (e) => { ch.titles = e.target.value; if (ch.titles !== "fixed") delete ch.title; renderChannels(); },
+        }, TITLE_OPTIONS.map(([v, label]) => option(v, label, v === (ch.titles || "filename")))));
+        if (ch.titles === "fixed") {
+          body.appendChild(el("input", {
+            type: "text", class: "ch-title", maxlength: 40, value: ch.title || "", placeholder: ch.name || "COMMERCIALS",
+            "aria-label": "The one name the guide shows",
+            onchange: (e) => { ch.title = e.target.value; },
+          }));
+        }
+      }
+
+      // A guide row has an empty body; leaving it out keeps the row tight.
+      const rows = body.childElementCount ? [head, body] : [head];
+      if (ch.type === "video") {
+        // Commercial breaks: spots from a second folder, cut into the program
+        // every so many minutes. "(none)" is the plain channel.
+        const b = ch.breaks;
+        const B = S.BREAKS;
+        const numberInput = (key, label, title) => el("input", {
+          type: "number", min: B[key].min, max: B[key].max, step: 1, value: b[key],
+          "aria-label": label, title,
+          onchange: (e) => {
+            b[key] = Math.round(S.clampNum(e.target.value, B[key].min, B[key].max, B[key].dflt));
+            e.target.value = b[key];
+          },
+        });
+        const breaksKnown = !b || channelFolders.some((f) => f.folder === b.folder);
+        const breaksRow = el("div", { class: "ch-body ch-breaks" }, [
+          el("span", { class: "note" }, "Breaks from"),
+          el("select", {
+            "aria-label": "Breaks folder",
+            onchange: (e) => {
+              const folder = e.target.value;
+              if (!folder) delete ch.breaks;
+              else ch.breaks = { folder, everyMinutes: b ? b.everyMinutes : B.everyMinutes.dflt, spots: b ? b.spots : B.spots.dflt };
+              renderChannels();
+            },
+          }, [
+            option("", "(none)", !b),
+            ...(b && !breaksKnown ? [option(b.folder, b.folder + "  (folder missing!)", true)] : []),
+            ...channelFolders.filter((f) => f.folder !== ch.folder).map((f) => option(f.folder, folderLabel(f), !!b && f.folder === b.folder)),
+          ]),
+        ]);
+        if (b) {
+          // Make the two break styles explicit. Internally everyMinutes=0 is
+          // the "between programs only" mode, which keeps the broadcast clock
+          // compatible with older config files while giving the control room a
+          // clear switch instead of requiring the operator to know that 0 is
+          // special.
+          const betweenProgramsOnly = b.everyMinutes === 0;
+          breaksRow.appendChild(el("span", { class: "ch-phrase" }, [
+            el("span", { class: "note" }, "Break timing"),
+            el("select", {
+              "aria-label": "Commercial break timing",
+              title: "Choose whether commercials may interrupt a program or only air after it ends",
+              onchange: (e) => {
+                if (e.target.value === "between") b.everyMinutes = 0;
+                else if (b.everyMinutes === 0) b.everyMinutes = B.everyMinutes.dflt;
+                renderChannels();
+              },
+            }, [
+              option("timed", "Timed during programs", !betweenProgramsOnly),
+              option("between", "Between programs only", betweenProgramsOnly),
+            ]),
+          ]));
+          if (!betweenProgramsOnly) {
+            breaksRow.appendChild(el("span", { class: "ch-phrase" }, [
+              el("span", { class: "note" }, "every"),
+              numberInput("everyMinutes", "Minutes of program between breaks", "Commercials may interrupt the program at this interval"),
+              el("span", { class: "note" }, "min of program,"),
+            ]));
+          }
+          breaksRow.appendChild(el("span", { class: "ch-phrase" }, [
+            numberInput("spots", "Spots per break", "How many spots run in each break"),
+            el("span", { class: "note" }, "spots per break"),
+          ]));
+        }
+        if (ch.mode !== "blocks") rows.push(breaksRow);
+
+        // Block programming is a channel scheduling mode with no main source.
+        // Each block owns its folder and window; when no block is active the
+        // channel uses its selected off-air treatment.
+        if (ch.mode === "blocks") {
+          if (!Array.isArray(ch.blocks)) ch.blocks = [];
+          const blocksRow = el("div", { class: "ch-body ch-blocks" });
+          blocksRow.appendChild(el("span", { class: "note" }, "Block programming (top = highest priority; up to 20 blocks)"));
+          ch.blocks.forEach((b, bi) => {
+            if (!b || typeof b !== "object") return;
+            const line = el("div", { class: "block-line" });
+            const enabled = el("input", { type: "checkbox", "aria-label": "Enable block " + (bi + 1) });
+            enabled.checked = b.enabled !== false;
+            enabled.addEventListener("change", () => { b.enabled = enabled.checked; });
+            line.appendChild(enabled);
+            line.appendChild(el("strong", null, String(bi + 1)));
+            line.appendChild(el("input", { type: "text", maxlength: 40, value: b.name || "", placeholder: "Block name", "aria-label": "Block name", onchange: (e) => { b.name = e.target.value; } }));
+            line.appendChild(el("select", { "aria-label": "Block type", onchange: (e) => { b.type = e.target.value; if (b.type === "segment" && !Array.isArray(b.segmentFolders)) b.segmentFolders = b.folder ? [b.folder] : [""]; renderChannels(); } }, [
+              option("normal", "Normal block", b.type !== "segment"), option("segment", "Segment block", b.type === "segment")
+            ]));
+            if (b.type === "segment") {
+              if (!Array.isArray(b.segmentFolders)) b.segmentFolders = b.folder ? [b.folder] : [""];
+              const seg = el("span", { class: "block-segment-folders" });
+              b.segmentFolders.slice(0,8).forEach((sf, si) => seg.appendChild(el("select", { "aria-label": "Segment folder " + (si+1), onchange: (e) => { b.segmentFolders[si]=e.target.value; } }, [
+                option("", "Folder " + (si+1), !sf), ...(sf && !channelFolders.some((f)=>f.folder===sf) ? [option(sf, sf+" (missing!)", true)] : []), ...channelFolders.map((f)=>option(f.folder, folderLabel(f), f.folder===sf))
+              ])));
+              if (b.segmentFolders.length < 8) seg.appendChild(el("button", { type:"button", class:"mini", onclick:()=>{ b.segmentFolders.push(""); renderChannels(); } }, "+ Folder"));
+              line.appendChild(seg);
+            } else {
+              line.appendChild(el("select", { "aria-label": "Block programming folder", onchange: (e) => { b.folder = e.target.value; } }, [option("", "(pick block folder)", !b.folder), ...(b.folder && !channelFolders.some((f)=>f.folder===b.folder) ? [option(b.folder,b.folder+"  (folder missing!)",true)] : []), ...channelFolders.map((f)=>option(f.folder,folderLabel(f),f.folder===b.folder))]));
+              line.appendChild(el("select", { "aria-label": "Block playback order", onchange: (e) => { b.order=e.target.value; } }, [option("sequence","In order",b.order!=="shuffle-daily"), option("shuffle-daily","Shuffled daily",b.order==="shuffle-daily")]));
+            }
+            const days = el("span", { class: "block-days" });
+            DAY_KEYS.forEach((day, di) => {
+              const lab = el("label", { class: "day-chip" });
+              const cb = el("input", { type: "checkbox" }); cb.checked = (b.days || []).includes(day);
+              cb.addEventListener("change", () => { b.days = DAY_KEYS.filter((d, j) => j === di ? cb.checked : (b.days || []).includes(d)); });
+              lab.appendChild(cb); lab.appendChild(document.createTextNode(DAY_LABELS[di])); days.appendChild(lab);
+            });
+            line.appendChild(days);
+            line.appendChild(el("input", { type: "time", value: b.start || "21:00", "aria-label": "Block start", onchange: (e) => { b.start = e.target.value; } }));
+            line.appendChild(el("span", { class: "note" }, "to"));
+            line.appendChild(el("input", { type: "time", value: b.end || "06:00", "aria-label": "Block end", onchange: (e) => { b.end = e.target.value; } }));
+            line.appendChild(el("button", { type: "button", class: "mini danger", title: "Remove this block", onclick: () => { ch.blocks.splice(bi, 1); renderChannels(); } }, "✕"));
+            blocksRow.appendChild(line);
+
+            // Commercial breaks belong to the block in Block Programming mode.
+            // This lets daytime and overnight blocks use completely different
+            // spot folders/timing while Always-on/Scheduled keep channel breaks.
+            const bb = b.breaks;
+            const B = S.BREAKS;
+            const br = el("div", { class: "block-breaks" }, [el("span", { class: "note" }, "Breaks from")]);
+            br.appendChild(el("select", { "aria-label": "Block breaks folder", onchange: (e) => {
+              const folder = e.target.value;
+              if (!folder) delete b.breaks;
+              else b.breaks = { folder, everyMinutes: bb ? bb.everyMinutes : B.everyMinutes.dflt, spots: bb ? bb.spots : B.spots.dflt };
+              renderChannels();
+            } }, [
+              option("", "(none)", !bb),
+              ...(bb && !channelFolders.some((f) => f.folder === bb.folder) ? [option(bb.folder, bb.folder + "  (folder missing!)", true)] : []),
+              ...channelFolders.filter((f) => f.folder !== b.folder).map((f) => option(f.folder, folderLabel(f), !!bb && f.folder === bb.folder)),
+            ]));
+            if (bb) {
+              const between = bb.everyMinutes === 0;
+              br.appendChild(el("select", { "aria-label": "Block commercial break timing", onchange: (e) => {
+                if (e.target.value === "between") bb.everyMinutes = 0;
+                else if (bb.everyMinutes === 0) bb.everyMinutes = B.everyMinutes.dflt;
+                renderChannels();
+              } }, [option("timed", "Timed during programs", !between), option("between", "Between programs only", between)]));
+              if (!between) br.appendChild(el("input", { type: "number", min: B.everyMinutes.min, max: B.everyMinutes.max, step: 1, value: bb.everyMinutes, "aria-label": "Block minutes between breaks", onchange: (e) => { bb.everyMinutes = Math.round(S.clampNum(e.target.value, B.everyMinutes.min, B.everyMinutes.max, B.everyMinutes.dflt)); e.target.value = bb.everyMinutes; } }));
+              if (!between) br.appendChild(el("span", { class: "note" }, "min"));
+              br.appendChild(el("input", { type: "number", min: B.spots.min, max: B.spots.max, step: 1, value: bb.spots, "aria-label": "Block spots per break", onchange: (e) => { bb.spots = Math.round(S.clampNum(e.target.value, B.spots.min, B.spots.max, B.spots.dflt)); e.target.value = bb.spots; } }));
+              br.appendChild(el("span", { class: "note" }, "spots per break"));
+            }
+            blocksRow.appendChild(br);
+          });
+          const add = el("button", { type: "button", class: "mini", disabled: ch.blocks.length >= 20 ? "disabled" : null, onclick: () => {
+            if (ch.blocks.length >= 20) return;
+            ch.blocks.push({ enabled: true, type: "normal", name: "Block " + (ch.blocks.length + 1), folder: "", order: "sequence", days: ["sat", "sun"], start: "21:00", end: "06:00" });
+            renderChannels();
+          } }, ch.blocks.length >= 20 ? "20 block maximum" : "+ Add Block");
+          blocksRow.appendChild(add);
+          rows.push(blocksRow);
+        }
+      }
+      if (ch.type === "video" && ch.mode === "schedule") {
+        const windowsHost = el("div", { class: "ch-windows" });
+        const windows = ch.schedule || (ch.schedule = []);
+        windows.forEach((w, wi) => {
+          windowsHost.appendChild(el("div", { class: "ch-window" }, [
+            ...DAY_KEYS.map((day, di) =>
+              el("button", {
+                type: "button", class: "day-chip", "aria-pressed": w.days.includes(day) ? "true" : "false",
+                onclick: (e) => {
+                  const on = w.days.includes(day);
+                  w.days = on ? w.days.filter((d) => d !== day) : [...w.days, day];
+                  e.target.setAttribute("aria-pressed", on ? "false" : "true");
+                  renderWeekGrid();
+                },
+              }, DAY_LABELS[di])),
+            el("input", { type: "time", value: w.start || "08:00", "aria-label": "Window start",
+              onchange: (e) => { w.start = e.target.value; renderWeekGrid(); } }),
+            "to",
+            el("input", { type: "time", value: w.end || "11:30", "aria-label": "Window end",
+              onchange: (e) => { w.end = e.target.value; renderWeekGrid(); } }),
+            el("button", { type: "button", class: "icon danger", title: "Remove window", "aria-label": "Remove window",
+              onclick: () => { windows.splice(wi, 1); renderChannels(); } }, "✕"),
+          ]));
+        });
+        windowsHost.appendChild(el("button", {
+          type: "button", class: "small add-row",
+          onclick: () => { windows.push({ days: ["sat"], start: "08:00", end: "11:30" }); renderChannels(); },
+        }, "+ Add window"));
+        rows.push(windowsHost);
+      }
+
+      host.appendChild(el("div", { class: "item ch-item" }, rows));
+    });
+    renderWeekGrid();
+  }
+
+  // The week as the schedule reads: seven day columns, on-air windows drawn
+  // as blocks. The way to catch "the cartoons window is on the wrong day"
+  // without waiting for Saturday.
+  function renderWeekGrid() {
+    const wrap = $("week-grid-wrap");
+    const grid = $("week-grid");
+    const scheduled = channels.filter((c) => c.type === "video" && c.mode === "schedule" && (c.schedule || []).length);
+    if (!scheduled.length) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    grid.innerHTML = "";
+    grid.appendChild(el("div", null, ""));
+    for (const label of ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]) {
+      grid.appendChild(el("div", { class: "wg-head" }, label));
+    }
+    const hours = el("div", { class: "wg-hours", style: "height:192px" });
+    for (const h of [0, 6, 12, 18, 24]) {
+      hours.appendChild(el("span", { class: "wg-hour", style: "top:" + (h / 24) * 100 + "%" }, String(h)));
+    }
+    grid.appendChild(hours);
+    // The schema expands overnight windows ("SAT 20:00-01:00") into an
+    // evening segment plus a next-morning segment, so they draw as two
+    // blocks the way a printed grid would show them.
+    const segsByDay = [[], [], [], [], [], [], []];
+    for (const ch of scheduled) {
+      for (const w of ch.schedule) {
+        for (const g of (S.windowSegments ? S.windowSegments(w) : [])) {
+          segsByDay[g.day].push({ ch, w, start: g.start, end: g.end });
+        }
+      }
+    }
+    for (let d = 0; d < 7; d++) {
+      const day = el("div", { class: "wg-day" });
+      for (const g of segsByDay[d]) {
+        day.appendChild(el("div", {
+          class: "wg-block",
+          style: "top:" + (g.start / 1440) * 100 + "%;height:" + Math.max(((g.end - g.start) / 1440) * 100, 4) + "%",
+          title: "CH " + g.ch.number + " " + (g.ch.name || "") + "  " + g.w.start + "-" + g.w.end,
+        }, String(g.ch.number)));
+      }
+      grid.appendChild(day);
+    }
+  }
+
+  // ---------------------------------------------------------- render: rotation
+
+  function renderRotation() {
+    const host = $("rotation");
+    host.innerHTML = "";
+    if (!rotation.length) {
+      host.appendChild(el("div", { class: "empty" }, "No pages yet. Add at least one."));
+    }
+    rotation.forEach((slot, i) => {
+      const typeSel = el("select", {
+        "aria-label": "Page type",
+        onchange: (e) => {
+          slot.type = e.target.value;
+          if (slot.type === "headlines" && !slot.feed) slot.feed = feeds[0] ? feeds[0].id : "";
+          renderRotation();
+        },
+      }, ROTATION_TYPES.map(([v, label]) => option(v, label, v === slot.type)));
+
+      let feedSel;
+      if (slot.type === "headlines") {
+        feedSel = el("select", {
+          "aria-label": "Feed for this slot",
+          onchange: (e) => { slot.feed = e.target.value; },
+        }, feeds.length
+          ? feeds.map((f) => option(f.id, f.label || f.id, f.id === slot.feed))
+          : [option("", "(add a feed first)", true)]);
+      } else {
+        feedSel = el("span", { class: "note" }, "");
+      }
+
+      host.appendChild(
+        el("div", { class: "item rot-item" }, [
+          el("span", { class: "grip" }, String(i + 1)),
+          typeSel,
+          feedSel,
+          el("div", { class: "row-actions" }, [
+            el("button", { type: "button", class: "icon", title: "Move up", "aria-label": "Move up", disabled: i === 0 ? "" : null,
+              onclick: () => { if (i > 0) { [rotation[i - 1], rotation[i]] = [rotation[i], rotation[i - 1]]; renderRotation(); } } }, "↑"),
+            el("button", { type: "button", class: "icon", title: "Move down", "aria-label": "Move down", disabled: i === rotation.length - 1 ? "" : null,
+              onclick: () => { if (i < rotation.length - 1) { [rotation[i + 1], rotation[i]] = [rotation[i], rotation[i + 1]]; renderRotation(); } } }, "↓"),
+            el("button", { type: "button", class: "icon danger", title: "Remove page", "aria-label": "Remove page",
+              onclick: () => { rotation.splice(i, 1); renderRotation(); } }, "✕"),
+          ]),
+        ])
+      );
+    });
+  }
+
+  // ---------------------------------------------------------- render: messages
+
+  function renderMessages() {
+    const host = $("messages");
+    host.innerHTML = "";
+    if (!messages.length) {
+      host.appendChild(el("div", { class: "empty" }, "No messages yet. Add a welcome, a bake sale, a lost dog."));
+    }
+    messages.forEach((m, i) => {
+      const colorSel = el("select", {
+        "aria-label": "Message color",
+        onchange: (e) => { m.color = e.target.value || null; },
+      }, [option("", "Auto (cycle)", !m.color)].concat(
+        COLOR_NAMES.map((c) => option(c, c.toUpperCase(), m.color === c))
+      ));
+      host.appendChild(
+        el("div", { class: "item msg-item" }, [
+          el("input", {
+            type: "text", value: m.text, placeholder: "HAPPY BIRTHDAY, RIVER",
+            "aria-label": "Message text", maxlength: "200",
+            oninput: (e) => { m.text = e.target.value; },
+          }),
+          colorSel,
+          el("div", { class: "row-actions" }, [
+            el("button", { type: "button", class: "icon danger", title: "Remove message", "aria-label": "Remove message",
+              onclick: () => { messages.splice(i, 1); renderMessages(); } }, "✕"),
+          ]),
+        ])
+      );
+    });
+  }
+
+  // ---------------------------------------------------------- render: chips
+
+  function colorChip(name, pressed, onToggle) {
+    const sw = el("span", { class: "sw" });
+    sw.style.background = PALETTE[name] || "#888";
+    const chip = el("button", {
+      type: "button", class: "chip", "aria-pressed": pressed ? "true" : "false",
+      onclick: () => onToggle(chip),
+    }, [sw, name.toUpperCase()]);
+    return chip;
+  }
+
+  function plainChip(label, pressed, onToggle) {
+    const chip = el("button", {
+      type: "button", class: "chip", "aria-pressed": pressed ? "true" : "false",
+      onclick: () => onToggle(chip),
+    }, label);
+    return chip;
+  }
+
+  function renderPageCycle() {
+    const host = $("pageCycle");
+    host.innerHTML = "";
+    COLOR_NAMES.forEach((name) => {
+      const on = pageCycle.includes(name);
+      host.appendChild(colorChip(name, on, (chip) => {
+        if (pageCycle.includes(name)) pageCycle = pageCycle.filter((c) => c !== name);
+        else pageCycle.push(name);
+        chip.setAttribute("aria-pressed", pageCycle.includes(name) ? "true" : "false");
+      }));
+    });
+  }
+
+  function renderCrawlFeeds() {
+    const host = $("crawlFeeds");
+    host.innerHTML = "";
+    if (!feeds.length) {
+      host.appendChild(el("span", { class: "note" }, "Add a feed to give the ticker something to scroll."));
+      return;
+    }
+    feeds.forEach((f) => {
+      if (!f.id) return;
+      const on = crawlFeeds.includes(f.id);
+      host.appendChild(plainChip(f.label || f.id, on, (chip) => {
+        if (crawlFeeds.includes(f.id)) crawlFeeds = crawlFeeds.filter((id) => id !== f.id);
+        else crawlFeeds.push(f.id);
+        chip.setAttribute("aria-pressed", crawlFeeds.includes(f.id) ? "true" : "false");
+      }));
+    });
+  }
+
+  // ---------------------------------------------------------- load & fill
+
+  function fillColorSelect(id, value) {
+    const sel = $(id);
+    sel.innerHTML = "";
+    COLOR_NAMES.forEach((c) => sel.appendChild(option(c, c.toUpperCase(), c === value)));
+  }
+
+  function fillReloadSelect(value) {
+    const sel = $("f-dailyReloadHour");
+    sel.innerHTML = "";
+    sel.appendChild(option("off", "Off", value === false));
+    for (let h = 0; h < 24; h++) {
+      const label = (h === 0 ? "12 AM" : h < 12 ? h + " AM" : h === 12 ? "12 PM" : (h - 12) + " PM");
+      sel.appendChild(option(String(h), label, value === h));
+    }
+  }
+
+  function fill(cfg) {
+    $("f-channelName").value = cfg.channelName || "";
+    $("f-tagline").value = cfg.tagline || "";
+    $("f-timeFormat").value = cfg.timeFormat === "24h" ? "24h" : "12h";
+    $("f-port").value = cfg.port != null ? cfg.port : 1982;
+    $("f-pageSeconds").value = cfg.pageSeconds;
+    $("f-refreshMinutes").value = cfg.refreshMinutes;
+    $("f-maxItemsPerFeed").value = cfg.maxItemsPerFeed;
+    $("f-overscanX").value = cfg.overscanX;
+    $("f-overscanY").value = cfg.overscanY;
+    $("f-crtMode").checked = cfg.crtMode === true;
+    $("f-crtInkText").checked = cfg.crtInkText === true;
+    $("f-textScale").value = cfg.textScale != null ? cfg.textScale : 1;
+    fillReloadSelect(cfg.dailyReloadHour);
+    const fx = cfg.fauxCrt || {};
+    $("f-fauxOn").checked = fx.on === true;
+    $("f-fauxSet").value = fx.set || "console";
+    for (const k of FAUX_SLIDERS) {
+      const id = "f-faux" + k[0].toUpperCase() + k.slice(1);
+      $(id).value = fx[k] != null ? fx[k] : 0;
+      $("o-faux" + k[0].toUpperCase() + k.slice(1)).value = $(id).value;
+    }
+    $("f-fauxMask").checked = fx.mask === true;
+    $("f-fauxReflection").checked = fx.reflection === true;
+
+    const crawl = cfg.crawl || {};
+    $("f-crawlFlag").value = crawl.flag != null ? crawl.flag : "";
+    $("f-crawlSeconds").value = crawl.secondsPerScreen != null ? crawl.secondsPerScreen : 9;
+    $("f-crawlSeparator").value = crawl.separator != null ? crawl.separator : "  ■  ";
+
+    const colors = cfg.colors || {};
+    const prev = cfg.preview || {};
+    $("f-previewName").value = prev.name || S.PREVIEW_DEFAULTS.name;
+    $("f-previewTagline").value = prev.tagline === undefined ? "" : prev.tagline;
+    $("f-previewSlots").value = prev.slots != null ? prev.slots : S.GUIDE.slots.dflt;
+    $("f-previewScroll").value = prev.scrollSeconds != null ? prev.scrollSeconds : S.GUIDE.scrollSeconds.dflt;
+    $("f-previewSeconds").checked = prev.seconds !== false;
+    fillColorSelect("f-previewBg", prev.background || "blue");
+    fillColorSelect("f-headerBg", colors.headerBg || "blue");
+    fillColorSelect("f-crawlBg", colors.crawlBg || "ink");
+
+    $("f-facts").value = (cfg.facts || []).join("\n");
+    $("f-dadJokes").value = (cfg.dadJokes || []).join("\n");
+    updateCounts();
+
+    const weather = cfg.weather || {};
+    const wloc = weather.location;
+    wxLocation = wloc && Number.isFinite(wloc.latitude)
+      ? { name: wloc.name || "", latitude: wloc.latitude, longitude: wloc.longitude, timezone: wloc.timezone || "auto" }
+      : null;
+    $("f-tempUnit").value = weather.tempUnit === "C" ? "C" : "F";
+    $("f-windUnit").value = weather.windUnit === "kmh" ? "kmh" : "mph";
+    $("f-wxTimezone").value = wxLocation ? wxLocation.timezone : "";
+    renderWxCurrent();
+
+    const music = cfg.music || {};
+    $("f-musicEnabled").checked = music.enabled !== false;
+    $("f-musicShuffle").checked = music.shuffle !== false;
+    $("f-musicVolume").value = music.volume != null ? music.volume : 60;
+    updateVolumeOut();
+    renderTrackList();
+
+    const cheer = cfg.cheerlights || {};
+    $("f-cheerEnabled").checked = cheer.enabled !== false;
+    $("f-cheerTemplate").value = cheer.template || "THE WORLD IS SET TO {COLOR}";
+
+    feeds = (cfg.feeds || []).map((f) => ({ id: f.id, label: f.label, url: f.url }));
+    rotation = (cfg.rotation || []).map((s) => (s.type === "headlines" ? { type: "headlines", feed: s.feed } : { type: s.type }));
+    messages = (cfg.messages || []).map((m) => ({ text: m.text, color: m.color || null }));
+    crawlFeeds = (crawl.feeds || []).slice();
+    pageCycle = (colors.pageCycle && colors.pageCycle.length ? colors.pageCycle : ["blue", "green", "red", "cyan"]).slice();
+
+    channels = (cfg.channels || []).map((c) => JSON.parse(JSON.stringify(c)));
+    const tuner = cfg.tuner || {};
+    const src = tuner.sources || {};
+    $("f-tunerKeyboard").checked = src.keyboard !== false;
+    $("f-tunerGamepad").checked = src.gamepad !== false;
+    $("f-tunerHttp").checked = src.http !== false;
+    $("f-tunerWrap").checked = tuner.wrap !== false;
+    $("f-tunerCut").value = tuner.cut || "static";
+    $("f-tunerPower").value = tuner.power || "crt";
+
+    renderFeeds();
+    renderRotation();
+    renderMessages();
+    renderCrawlFeeds();
+    renderPageCycle();
+    renderChannels();
+    refreshChannelFolders();
+  }
+
+  // The folder picker's inventory: what actually sits under channels/, with
+  // file counts and (once probed) total run time. Never a typed path.
+  async function refreshChannelFolders() {
+    try {
+      const r = await fetch("api/channels", { cache: "no-store" });
+      if (!r.ok) return;
+      channelFolders = (await r.json()).folders || [];
+      renderChannels();
+    } catch (e) {
+      /* server-less preview: the picker just shows the configured folder */
+    }
+  }
+
+  // ---------------------------------------------------------- weather
+
+  function renderWxCurrent() {
+    const host = $("wxCurrent");
+    host.innerHTML = "";
+    if (wxLocation && Number.isFinite(wxLocation.latitude)) {
+      host.appendChild(el("span", null, wxLocation.name || "Selected location"));
+      host.appendChild(el("span", { class: "muted" },
+        "  (" + wxLocation.latitude.toFixed(2) + ", " + wxLocation.longitude.toFixed(2) + ")"));
+    } else {
+      host.appendChild(el("span", { class: "muted" }, "No location set - search for your town below."));
+    }
+  }
+
+  function chooseWxLocation(r) {
+    wxLocation = {
+      name: [r.name, r.admin1, r.country].filter(Boolean).join(", "),
+      latitude: r.latitude,
+      longitude: r.longitude,
+      timezone: r.timezone || "auto",
+    };
+    $("f-wxTimezone").value = wxLocation.timezone;
+    $("wxResults").innerHTML = "";
+    $("wxSearch").value = "";
+    renderWxCurrent();
+  }
+
+  async function lookupWx() {
+    const q = $("wxSearch").value.trim();
+    const host = $("wxResults");
+    if (!q) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "note" }, "Searching…"));
+    try {
+      const r = await fetch("api/geocode?q=" + encodeURIComponent(q), { cache: "no-store" });
+      const j = await r.json().catch(() => ({}));
+      host.innerHTML = "";
+      const results = (j.results || []);
+      if (!results.length) {
+        host.appendChild(el("div", { class: "note" }, "No matches for “" + q + "”."));
+        return;
+      }
+      results.forEach((res) => {
+        const label = [res.name, res.admin1, res.country].filter(Boolean).join(", ");
+        host.appendChild(el("button", {
+          type: "button", class: "small wx-result",
+          onclick: () => chooseWxLocation(res),
+        }, label));
+      });
+    } catch (e) {
+      host.innerHTML = "";
+      host.appendChild(el("div", { class: "note" }, "Lookup failed. Is the channel online?"));
+    }
+  }
+
+  function updateCounts() {
+    const nf = linesToArray($("f-facts").value).length;
+    const nj = linesToArray($("f-dadJokes").value).length;
+    $("factsCount").textContent = nf ? "(" + nf + ")" : "";
+    $("jokesCount").textContent = nj ? "(" + nj + ")" : "";
+  }
+
+  // The faux CRT sliders each show their number beside them.
+  function wireFauxSliders() {
+    for (const k of FAUX_SLIDERS) {
+      const K = k[0].toUpperCase() + k.slice(1);
+      $("f-faux" + K).addEventListener("input", () => { $("o-faux" + K).value = $("f-faux" + K).value; });
+    }
+  }
+
+  function updateVolumeOut() {
+    $("musicVolumeOut").textContent = $("f-musicVolume").value + "%";
+  }
+
+  async function renderTrackList() {
+    const host = $("trackList");
+    const count = $("trackCount");
+    host.innerHTML = "";
+    try {
+      const r = await fetch("api/music", { cache: "no-store" });
+      const j = await r.json();
+      const tracks = j.tracks || [];
+      count.textContent = tracks.length ? "(" + tracks.length + ")" : "";
+      if (!tracks.length) {
+        host.appendChild(el("div", { class: "empty" }, "No tracks yet - drop audio files into the music/ folder, then reload."));
+        return;
+      }
+      tracks.forEach((t, i) => {
+        host.appendChild(el("div", null, [
+          el("span", { class: "num" }, String(i + 1).padStart(2, "0")),
+          t.file,
+        ]));
+      });
+    } catch (e) {
+      count.textContent = "";
+      host.appendChild(el("div", { class: "empty" }, "Could not read the music folder."));
+    }
+  }
+
+  function setStatus(text, kind) {
+    const s = $("status");
+    s.textContent = text;
+    s.className = "status" + (kind ? " " + kind : "");
+    // Clear any prior warnings list.
+    const old = document.querySelector(".savebar .warnings");
+    if (old) old.remove();
+  }
+
+  async function load() {
+    setStatus("Loading current channel…");
+    let r;
+    try {
+      r = await fetch("api/config", { cache: "no-store" });
+    } catch (e) {
+      return setStatus("Could not reach the server (" + e.message + "). Is CABLE 82 running?", "err");
+    }
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || !j.config) {
+      // The server answered but has nothing good to serve: a config.json it
+      // could not read. Say that, with the line and column, and offer the
+      // way out: a Save from here writes a good file over it. The form is
+      // filled from the bundled defaults so there is something to save.
+      if (j && j.error) {
+        bootVersion = null;
+        fill(S.validateConfig(S.DEFAULT_CONFIG).cfg);
+        $("app").setAttribute("aria-busy", "false");
+        $("save").disabled = false;
+        return setStatus(j.error + ". Nothing is on the air. Fix the file by hand, or Save from here to write the defaults over it.", "err");
+      }
+      return setStatus("The server answered " + r.status + " and did not say why. Check its log.", "err");
+    }
+    bootVersion = j.version;
+    fill(j.config);
+    $("app").setAttribute("aria-busy", "false");
+    $("save").disabled = false;
+    if (j.warning) setStatus(j.warning, "warn");
+    else setStatus("Loaded. Edit anything, then Save.");
+    startDriftWatch();
+  }
+
+  // Warn if config.json moves while this screen is open (a hand edit, or a
+  // save from another tab). The form keeps your edits either way; a stale
+  // Save is refused by the server, so this is the early heads-up.
+  let driftTimer = null;
+  function startDriftWatch() {
+    if (driftTimer) return;
+    driftTimer = setInterval(async () => {
+      try {
+        const r = await fetch("api/config", { cache: "no-store" });
+        if (!r.ok) return;
+        const j = await r.json();
+        if (j.warning) {
+          setStatus(j.warning, "warn"); // the file on disk broke since we loaded
+        } else if (bootVersion && j.version && j.version !== bootVersion) {
+          setStatus("config.json changed outside this screen. Reload the page to load it; a stale Save will be refused.", "warn");
+        }
+      } catch (e) {
+        /* offline: the save path reports it */
+      }
+    }, 20000);
+  }
+
+  // ---------------------------------------------------------- gather & save
+
+  function numVal(id) {
+    const v = $(id).value.trim();
+    return v === "" ? undefined : Number(v);
+  }
+
+  function gather() {
+    const reload = $("f-dailyReloadHour").value;
+    return {
+      channelName: $("f-channelName").value,
+      tagline: $("f-tagline").value,
+      timeFormat: $("f-timeFormat").value,
+      port: numVal("f-port"),
+      pageSeconds: numVal("f-pageSeconds"),
+      refreshMinutes: numVal("f-refreshMinutes"),
+      maxItemsPerFeed: numVal("f-maxItemsPerFeed"),
+      overscanX: numVal("f-overscanX"),
+      overscanY: numVal("f-overscanY"),
+      crtMode: $("f-crtMode").checked,
+      crtInkText: $("f-crtInkText").checked,
+      textScale: numVal("f-textScale"),
+      fauxCrt: Object.assign(
+        { on: $("f-fauxOn").checked, set: $("f-fauxSet").value, mask: $("f-fauxMask").checked, reflection: $("f-fauxReflection").checked },
+        Object.fromEntries(FAUX_SLIDERS.map((k) => [k, Number($("f-faux" + k[0].toUpperCase() + k.slice(1)).value)]))
+      ),
+      dailyReloadHour: reload === "off" ? false : Number(reload),
+      facts: linesToArray($("f-facts").value),
+      dadJokes: linesToArray($("f-dadJokes").value),
+      weather: {
+        location: wxLocation
+          ? {
+              name: wxLocation.name,
+              latitude: wxLocation.latitude,
+              longitude: wxLocation.longitude,
+              timezone: $("f-wxTimezone").value.trim() || "auto",
+            }
+          : null,
+        tempUnit: $("f-tempUnit").value,
+        windUnit: $("f-windUnit").value,
+      },
+      music: {
+        enabled: $("f-musicEnabled").checked,
+        shuffle: $("f-musicShuffle").checked,
+        volume: Number($("f-musicVolume").value),
+      },
+      cheerlights: {
+        enabled: $("f-cheerEnabled").checked,
+        template: $("f-cheerTemplate").value,
+      },
+      channels: channels.map((c) => JSON.parse(JSON.stringify(c))),
+      preview: {
+        name: $("f-previewName").value.trim(),
+        tagline: $("f-previewTagline").value.trim(),
+        slots: numVal("f-previewSlots"),
+        scrollSeconds: numVal("f-previewScroll"),
+        seconds: $("f-previewSeconds").checked,
+        background: $("f-previewBg").value,
+      },
+      tuner: {
+        sources: {
+          keyboard: $("f-tunerKeyboard").checked,
+          gamepad: $("f-tunerGamepad").checked,
+          http: $("f-tunerHttp").checked,
+        },
+        wrap: $("f-tunerWrap").checked,
+        cut: $("f-tunerCut").value,
+        power: $("f-tunerPower").value,
+      },
+      feeds: feeds.map((f) => ({ id: f.id, label: f.label, url: f.url })),
+      rotation: rotation.map((s) => (s.type === "headlines" ? { type: "headlines", feed: s.feed } : { type: s.type })),
+      messages: messages.map((m) => ({ text: m.text, color: m.color })),
+      crawl: {
+        feeds: crawlFeeds.slice(),
+        secondsPerScreen: numVal("f-crawlSeconds"),
+        separator: $("f-crawlSeparator").value,
+        flag: $("f-crawlFlag").value,
+      },
+      colors: {
+        pageCycle: pageCycle.slice(),
+        headerBg: $("f-headerBg").value,
+        crawlBg: $("f-crawlBg").value,
+      },
+    };
+  }
+
+  function showWarnings(list) {
+    if (!list || !list.length) return;
+    const ul = el("ul", { class: "warnings" }, list.map((w) => el("li", null, w)));
+    $("status").after(ul);
+  }
+
+  async function save() {
+    const btn = $("save");
+    btn.disabled = true;
+    setStatus("Saving…");
+    try {
+      const headers = { "content-type": "application/json", "x-cable82-config": "1" };
+      if (bootVersion) headers["x-cable82-config-version"] = bootVersion;
+      const r = await fetch("api/config", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(gather()),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 409 || j.conflict) {
+        setStatus("config.json changed outside this screen (a hand edit or another tab). Reload the page to load it, then redo your change.", "err");
+        btn.disabled = false;
+        return;
+      }
+      if (!r.ok || j.ok === false) {
+        setStatus("Save rejected.", "err");
+        showWarnings(j.errors || ["The server refused the change."]);
+        btn.disabled = false;
+        return;
+      }
+      bootVersion = j.version;
+      fill(j.config); // reflect the canonical, cleaned-up config
+      const cleaned = [];
+      if (j.warnings && j.warnings.length) cleaned.push.apply(cleaned, j.warnings);
+      setStatus("Saved. The display picks it up now.", cleaned.length ? "warn" : "ok");
+      showWarnings(cleaned);
+      btn.disabled = false;
+    } catch (e) {
+      setStatus("Save failed (" + e.message + ").", "err");
+      btn.disabled = false;
+    }
+  }
+
+  // ------------------------------------------------- version + navigation
+
+  // What release is this? The server reads it from the checkout at startup.
+  // A zip download or a folder vendored inside another repo has no answer,
+  // and says so rather than guessing.
+  async function loadVersion() {
+    const chip = $("version");
+    const line = $("releaseVersion");
+    const note = $("releaseNote");
+    let v = null;
+    try {
+      const r = await fetch("api/version", { cache: "no-store" });
+      if (r.ok) v = await r.json();
+    } catch (e) {
+      /* offline or an older server: say unknown rather than guess */
+    }
+    const repo = (v && v.repo) || "https://github.com/nothans/cable-82";
+    $("releaseRepo").href = repo;
+    if (!v || !v.version) {
+      chip.textContent = "version unknown";
+      chip.href = repo;
+      chip.title = "This install is not a checkout of a release, so it cannot name a version.";
+      line.textContent = "unknown";
+      note.textContent = v
+        ? "No release to read: this is a copy of the files, not a checkout. Build " + v.build + "."
+        : "The server did not answer.";
+      return;
+    }
+    chip.textContent = v.version;
+    chip.href = v.release ? repo + "/releases/tag/" + v.release : repo;
+    chip.title = v.release ? "Release " + v.release : "Ahead of the last release";
+    line.textContent = v.version;
+    note.textContent = v.release
+      ? "Build " + v.build + ". A clean checkout of this release."
+      : "Build " + v.build + ". Past the last tag, or with local edits.";
+  }
+
+  // ------------------------------------------------- vitals
+
+  const GB = (b) => (b / 1073741824).toFixed(b < 10737418240 ? 1 : 0) + " GB";
+  function ago(sec) {
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    return m + "m";
+  }
+
+  function vital(label, value, sub, tone) {
+    return el("div", { class: "vital" }, [
+      el("label", null, label),
+      el("div", { class: "v" + (tone ? " " + tone : "") }, value),
+      sub ? el("div", { class: "sub" }, sub) : null,
+    ]);
+  }
+
+  async function loadVitals() {
+    let v = null;
+    try {
+      const r = await fetch("api/vitals", { cache: "no-store" });
+      if (r.ok) v = await r.json();
+    } catch (e) {
+      /* offline: leave the last reading */
+    }
+    if (!v) return;
+    const host = $("vitals");
+    host.innerHTML = "";
+    host.appendChild(vital("Up", ago(v.uptimeSec), "the station for " + ago(v.station.uptimeSec)));
+    const mem = v.memory;
+    host.appendChild(vital("Memory", mem.usedPercent + "% used", GB(mem.freeBytes) + " free of " + GB(mem.totalBytes), mem.usedPercent > 90 ? "bad" : mem.usedPercent > 75 ? "warn" : ""));
+    if (v.swap && v.swap.totalBytes) {
+      const usedPct = Math.round(((v.swap.totalBytes - v.swap.freeBytes) / v.swap.totalBytes) * 100);
+      host.appendChild(vital("Swap", usedPct + "% used", GB(v.swap.freeBytes) + " free of " + GB(v.swap.totalBytes), usedPct > 50 ? "warn" : ""));
+    }
+    // Windows has no load average; Node reports zeros there, which would read as a claim.
+    if (v.host.platform !== "win32") host.appendChild(vital("Load", v.load.join("  "), v.cpu.count + " cores, 1 / 5 / 15 min", v.load[0] > v.cpu.count ? "warn" : ""));
+    if (v.cpu.temperatureC != null) {
+      host.appendChild(vital("CPU", v.cpu.temperatureC + " °C", v.cpu.temperatureC >= 80 ? "throttling starts at 80" : "", v.cpu.temperatureC >= 80 ? "bad" : v.cpu.temperatureC >= 70 ? "warn" : ""));
+    }
+    const t = v.cpu.throttled;
+    if (t) {
+      const now = [t.underVoltageNow && "under-voltage", t.throttledNow && "throttled", t.frequencyCappedNow && "frequency capped", t.softTempLimitNow && "temperature limit"].filter(Boolean);
+      const since = [t.underVoltageSinceBoot && "under-voltage", t.throttledSinceBoot && "throttled", t.frequencyCappedSinceBoot && "capped", t.softTempLimitSinceBoot && "temperature limit"].filter(Boolean);
+      host.appendChild(vital("Power", now.length ? now.join(", ") : "OK", since.length ? "since boot: " + since.join(", ") + " (" + t.raw + ")" : t.raw, now.length ? "bad" : since.length ? "warn" : ""));
+    }
+    for (const d of v.disks) {
+      const usedPct = Math.round(((d.totalBytes - d.freeBytes) / d.totalBytes) * 100);
+      host.appendChild(vital("Disk, " + d.label, GB(d.freeBytes) + " free", usedPct + "% of " + GB(d.totalBytes) + " used", d.freeBytes < 1073741824 ? "bad" : usedPct > 90 ? "warn" : ""));
+    }
+    host.appendChild(vital("Sets listening", String(v.listeners), v.listeners ? "on the tuner bus" : "open the display"));
+    $("vitalsNote").textContent = (v.host.model || v.host.name) + ", " + v.host.platform + " " + v.host.arch + ", Node " + v.host.node + ". Read " + new Date(v.at).toLocaleTimeString() + ".";
+  }
+
+  function startVitals() {
+    loadVitals();
+    setInterval(() => { if (!document.hidden) loadVitals(); }, 10000);
+  }
+
+  // Restart and shut down, offered only where they would work: a Raspberry Pi
+  // whose user can power it without a password. Each button arms first and
+  // fires on the second press, because there is no undo for either.
+  async function loadPower() {
+    let sys = null;
+    try {
+      const r = await fetch("api/system", { cache: "no-store" });
+      if (r.ok) sys = await r.json();
+    } catch (e) {
+      /* an older server: leave the panel hidden */
+    }
+    if (!sys || !sys.power) return;
+    $("p-power").hidden = false;
+    if (sys.model) $("p-power").querySelector(".hint").textContent += " This one is a " + sys.model + ".";
+    wirePowerButton("restartHost", "restartNote", "restart", "Restart", "Restarting. The picture goes dark and comes back in about a minute.");
+    wirePowerButton("shutdownHost", "shutdownNote", "shutdown", "Shut down", "Shutting down. When the green light stops blinking it is safe to pull the power.");
+  }
+
+  function wirePowerButton(id, noteId, cmd, label, doneText) {
+    const btn = $(id);
+    const note = $(noteId);
+    const first = note.textContent;
+    let armed = false;
+    let timer = null;
+    const disarm = () => {
+      armed = false;
+      clearTimeout(timer);
+      btn.textContent = label + "…";
+      btn.classList.remove("armed");
+      note.textContent = first;
+    };
+    btn.addEventListener("click", async () => {
+      if (!armed) {
+        armed = true;
+        btn.textContent = "Press again to " + label.toLowerCase();
+        btn.classList.add("armed");
+        note.textContent = "Nothing has happened yet.";
+        timer = setTimeout(disarm, 6000);
+        return;
+      }
+      clearTimeout(timer);
+      btn.disabled = true;
+      btn.textContent = label + "ing…";
+      try {
+        const r = await fetch("api/system", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cable82-config": "1" },
+          body: JSON.stringify({ cmd }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        note.textContent = doneText;
+        setStatus(doneText, "ok");
+        $("save").disabled = true;
+        $("restartHost").disabled = true;
+        $("shutdownHost").disabled = true;
+      } catch (e) {
+        btn.disabled = false;
+        disarm();
+        note.textContent = "It did not go through: " + String(e.message || e).slice(0, 80);
+        setStatus("Could not " + label.toLowerCase() + " the machine.", "err");
+      }
+    });
+  }
+
+  // The group nav follows the scroll, so the progression is always placed.
+  function wireGroupNav() {
+    const head = document.querySelector("header.masthead");
+    const links = Array.from(document.querySelectorAll(".groupnav a"));
+    const groups = links
+      .map((a) => document.getElementById(a.getAttribute("href").slice(1)))
+      .filter(Boolean);
+    if (!groups.length) return;
+    const setHeadHeight = () =>
+      document.documentElement.style.setProperty("--head-h", head.offsetHeight + 16 + "px");
+    setHeadHeight();
+    addEventListener("resize", setHeadHeight);
+    const mark = (id) => links.forEach((a) => a.classList.toggle("on", a.getAttribute("href") === "#" + id));
+    // Whichever group covers the top of the reading area wins; at the very
+    // bottom of the page the last one does, since it may be too short to reach.
+    const spy = () => {
+      const top = head.offsetHeight + 24;
+      let current = groups[0].id;
+      for (const g of groups) if (g.getBoundingClientRect().top <= top) current = g.id;
+      if (innerHeight + scrollY >= document.body.scrollHeight - 4) current = groups[groups.length - 1].id;
+      mark(current);
+    };
+    spy();
+    addEventListener("scroll", spy, { passive: true });
+    mark((location.hash || "#" + groups[0].id).slice(1));
+  }
+
+  // ---------------------------------------------------------- wire up
+
+  document.addEventListener("DOMContentLoaded", () => {
+    $("addFeed").addEventListener("click", () => { feeds.push({ id: "", label: "", url: "" }); renderFeeds(); });
+    $("addSlot").addEventListener("click", () => {
+      rotation.push(feeds.length ? { type: "headlines", feed: feeds[0].id } : { type: "clock" });
+      renderRotation();
+    });
+    $("addMessage").addEventListener("click", () => { messages.push({ text: "", color: null }); renderMessages(); });
+    $("addChannel").addEventListener("click", () => {
+      // Next free number up the dial, starting where cable channels lived.
+      let n = 2;
+      while (channels.some((c) => c.number === n)) n++;
+      if (!channels.length) channels.push({ number: 82, name: "", type: "bulletin", enabled: true });
+      else channels.push({ number: n, name: "", type: "video", enabled: true, folder: "", mode: "continuous", order: "sequence", offAir: "testcard", titles: "filename" });
+      renderChannels();
+    });
+    $("f-facts").addEventListener("input", updateCounts);
+    $("f-dadJokes").addEventListener("input", updateCounts);
+    $("wxLookup").addEventListener("click", lookupWx);
+    $("wxSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); lookupWx(); } });
+    $("f-musicVolume").addEventListener("input", updateVolumeOut);
+    wireFauxSliders();
+    wireGroupNav();
+    loadVersion();
+    loadPower();
+    startVitals();
+    $("save").addEventListener("click", save);
+    $("revert").addEventListener("click", load);
+    load();
+  });
+})();

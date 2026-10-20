@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CABLE 82</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="letterbox">
+  <!-- Faux CRT (config fauxCrt, flat panels): the drawn console the stage
+       sits in. set.js draws it and places the stage in its glass. -->
+  <div id="set" hidden></div>
+  <div id="stage">
+    <header id="band-header">
+      <div id="header-left">
+        <div id="ch-name">CABLE 82</div>
+        <div id="ch-tagline">COMMUNITY BULLETIN BOARD</div>
+      </div>
+      <div id="header-right">
+        <div id="ch-clock">--:--</div>
+        <div id="ch-date"></div>
+      </div>
+    </header>
+    <main id="page">
+      <div id="page-kicker"></div>
+      <div id="page-body"></div>
+      <div id="page-time"></div>
+      <div id="page-date"></div>
+      <div id="page-weather">
+        <div id="wx-location"></div>
+        <div id="wx-temp"></div>
+        <div id="wx-cond"></div>
+        <div id="wx-hilo"></div>
+        <div id="wx-sun"></div>
+      </div>
+    </main>
+    <footer id="band-crawl">
+      <div id="crawl-flag"></div>
+      <div id="crawl-window">
+        <div id="crawl-track"></div>
+      </div>
+    </footer>
+    <div id="error-card" hidden>
+      <div id="error-title">PLEASE STAND BY</div>
+      <div id="error-sub">WE ARE EXPERIENCING TECHNICAL DIFFICULTIES</div>
+      <div id="error-detail"></div>
+    </div>
+    <!-- The dial. index.html is the tuner: these layers cover the bulletin
+         board when another channel is showing. One page, forever - a channel
+         change is a DOM operation, never a navigation. -->
+    <div id="video-layer" hidden>
+      <!-- Two buffers: one on the air, one cueing the next program, so a
+           file boundary is a cut instead of a load. -->
+      <!-- disableRemotePlayback keeps Chromium from floating a Cast button over
+           the picture when it spots a cast device on the network; a TV channel
+           has no business offering to be sent to another TV. -->
+      <video playsinline disableRemotePlayback disablePictureInPicture x-webkit-airplay="deny"></video>
+      <video playsinline disableRemotePlayback disablePictureInPicture x-webkit-airplay="deny" hidden></video>
+    </div>
+    <div id="card-layer" hidden>
+      <div id="card-bars"></div>
+      <div id="card-clock">--:--</div>
+      <div id="card-name"></div>
+      <div id="card-msg"></div>
+    </div>
+    <!-- Channel 0: the guide. A masthead with the clock, then the grid, and
+         the rows crawl upward when there are more channels than fit. -->
+    <div id="guide-layer" hidden>
+      <div id="guide-head">
+        <div id="guide-logo">
+          <span class="cv-mark">
+            <span class="cv-word" id="guide-name">CABLEVUE</span>
+            <span class="cv-ring" aria-hidden="true"></span>
+          </span>
+          <span class="cv-sub" id="guide-tagline"></span>
+        </div>
+        <div id="guide-clock">--:--</div>
+      </div>
+      <div id="guide-cols">
+        <div class="gc-ch"></div>
+        <div class="gc-slot"></div>
+        <div class="gc-slot"></div>
+        <div class="gc-slot"></div>
+      </div>
+      <div id="guide-view">
+        <div id="guide-rows"></div>
+      </div>
+    </div>
+    <div id="external-layer" hidden></div>
+    <canvas id="tuner-snow" width="160" height="120" hidden></canvas>
+    <!-- Faux CRT tells over the picture: scanlines, the phosphor mask, the
+         dark corners, grain, the glass reflection, the mains breathe. All
+         inert unless the stage is in a faux set (style.css). -->
+    <div id="tube" aria-hidden="true">
+      <div id="tube-scan"></div>
+      <div id="tube-mask"></div>
+      <canvas id="tube-noise" width="320" height="240" hidden></canvas>
+      <div id="tube-vig"></div>
+      <div id="tube-refl"></div>
+      <div id="tube-flick"></div>
+    </div>
+    <div id="tuner-blank" hidden></div>
+    <!-- The on-screen display: the channel on a tune, the digits as they
+         are typed, the volume as a meter of cells. -->
+    <div id="channel-bug" hidden>
+      <div id="bug-number"></div>
+      <div id="bug-name" hidden></div>
+      <div id="bug-meter" hidden></div>
+    </div>
+  </div>
+  <!-- Switched off: the dark screen the set collapses into. It sits outside
+       the stage so the stage itself can fold up behind it. -->
+  <div id="power-off" hidden>
+    <div id="crt-line"></div>
+  </div>
+  <!-- The tube filter for faux CRT: bloom, then the barrel of the glass,
+       then the weak-signal wave, as one SVG filter on the stage. set.js fills
+       in the maps and the strengths; with every picture tell at 0 the stage
+       carries no filter at all. -->
+  <svg id="tube-svg" width="0" height="0" aria-hidden="true" focusable="false">
+    <filter id="tube-filter" filterUnits="objectBoundingBox" primitiveUnits="objectBoundingBox" x="0" y="0" width="1" height="1" color-interpolation-filters="sRGB">
+      <feGaussianBlur id="tube-blur" in="SourceGraphic" stdDeviation="0" result="blur"/>
+      <feComponentTransfer in="blur" result="glow">
+        <feFuncR type="linear" slope="0.55"/><feFuncG type="linear" slope="0.55"/><feFuncB type="linear" slope="0.55"/>
+      </feComponentTransfer>
+      <feBlend in="SourceGraphic" in2="glow" mode="screen" result="bloomed"/>
+      <feImage id="tube-barrel-map" preserveAspectRatio="none" x="0" y="0" width="1" height="1" result="bmap"/>
+      <feDisplacementMap id="tube-barrel" in="bloomed" in2="bmap" scale="0" xChannelSelector="R" yChannelSelector="G" result="curved"/>
+      <feImage id="tube-wave-map" preserveAspectRatio="none" x="0" y="0" width="1" height="1" result="wimg"/>
+      <feTile in="wimg" result="wtile"/>
+      <feOffset id="tube-wave-off" in="wtile" dx="0" dy="0" result="wmap"/>
+      <feDisplacementMap id="tube-wave" in="curved" in2="wmap" scale="0" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </svg>
+</div>
+<!-- One file per part of the set, in dependency order, no build step:
+     the schema, the broadcast clock, channel 82, channel 0, the player, the
+     faux set, the dial, and the boot that wires them up. -->
+<script src="config-schema.js"></script>
+<script src="dial.js"></script>
+<script src="board.js"></script>
+<script src="guide.js"></script>
+<script src="video.js"></script>
+<script src="set.js"></script>
+<script src="tuner.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

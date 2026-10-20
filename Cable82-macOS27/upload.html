@@ -1,0 +1,48 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CABLE 82 Bulk Upload</title>
+<style>
+body{background:#050505;color:#eee;font:16px system-ui,-apple-system,sans-serif;margin:0;padding:24px;max-width:900px}h1{color:#ff7a00;margin-bottom:4px}.box{border:3px dashed #888;border-radius:12px;padding:35px;text-align:center;margin:20px 0}.box.drag{border-color:#ff7a00;background:#181008}button,input,select{font:inherit;padding:10px;margin:5px}.bar{height:16px;background:#333;border-radius:8px;overflow:hidden}.bar>i{display:block;height:100%;background:#ff7a00;width:0}.row{margin:12px 0}.ok{color:#6f6}.bad{color:#f66}small{color:#aaa}#log{white-space:pre-wrap;max-height:260px;overflow:auto;background:#111;padding:10px}.hidden{display:none}label{font-weight:600}
+</style></head>
+<body><h1>CABLE 82</h1><h2>Bulk File Upload</h2>
+<div class="row"><label for="area">Save to:</label> <select id="area"><option value="channels">Channels</option><option value="music">Music</option></select></div>
+<div class="row" id="channelRow"><label for="folderSelect">Channel / Folder:</label> <select id="folderSelect"><option value="">Loading folders…</option></select> <span id="newFolderWrap" class="hidden"><input id="newFolder" placeholder="New folder name" autocomplete="off"></span></div>
+<div id="musicNote" class="row hidden"><small>Music files are saved directly in Cable82/music. No subfolders are used.</small></div>
+<div id="drop" class="box"><b>Drop files or folders here</b><br><small>or choose multiple files</small><br>
+<input id="files" type="file" multiple><br>
+<button id="start">Upload selected files</button></div>
+<div class="row"><b id="status">Ready</b><div class="bar"><i id="prog"></i></div></div><div id="log"></div>
+<script>
+const $=x=>document.getElementById(x), chosen=[]; let busy=false;
+function add(list){for(const f of list){if(!chosen.some(x=>x.file===f)) chosen.push({file:f,path:f.webkitRelativePath||f.name})} $('status').textContent=chosen.length+' file(s) selected';}
+$('files').onchange=e=>add(e.target.files);
+const drop=$('drop'); ['dragenter','dragover'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add('drag')})); ['dragleave','drop'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove('drag')}));
+drop.addEventListener('drop',async e=>{const items=[...e.dataTransfer.items]; if(items.some(i=>i.webkitGetAsEntry)){for(const i of items){const en=i.webkitGetAsEntry();if(en)await walk(en,'')}}else add(e.dataTransfer.files)});
+function readEntries(r){return new Promise(ok=>{let all=[];const more=()=>r.readEntries(a=>{if(!a.length)ok(all);else{all=all.concat(a);more()}});more()})}
+async function walk(en,p){if(en.isFile){await new Promise(ok=>en.file(f=>{chosen.push({file:f,path:p+f.name});ok()}))}else if(en.isDirectory){for(const c of await readEntries(en.createReader()))await walk(c,p+en.name+'/')} $('status').textContent=chosen.length+' file(s) selected';}
+function log(t,c=''){const d=document.createElement('div');d.textContent=t;d.className=c;$('log').appendChild(d);$('log').scrollTop=1e9}
+function safeFolderName(s){return s.trim().replace(/^\/+|\/+$/g,'').replace(/[\\/]/g,'-')}
+async function loadFolders(){
+  const sel=$('folderSelect');
+  try{
+    const r=await fetch('/api/channels',{cache:'no-store'}); if(!r.ok)throw Error('HTTP '+r.status);
+    const data=await r.json(); const names=(data.folders||[]).map(x=>x.folder).filter(Boolean);
+    sel.textContent='';
+    for(const name of names){const o=document.createElement('option');o.value=name;o.textContent=name;sel.appendChild(o)}
+    const n=document.createElement('option');n.value='__new__';n.textContent='+ New Folder…';sel.appendChild(n);
+    if(!names.length){sel.value='__new__';$('newFolderWrap').classList.remove('hidden')}
+  }catch(e){sel.innerHTML='<option value="__new__">+ New Folder…</option>';$('newFolderWrap').classList.remove('hidden');log('Could not load existing folders: '+e.message,'bad')}
+}
+$('folderSelect').onchange=()=>{$('newFolderWrap').classList.toggle('hidden',$('folderSelect').value!=='__new__'); if($('folderSelect').value==='__new__')$('newFolder').focus()};
+$('area').onchange=()=>{const music=$('area').value==='music';$('channelRow').classList.toggle('hidden',music);$('musicNote').classList.toggle('hidden',!music)};
+function selectedFolder(){if($('folderSelect').value==='__new__')return safeFolderName($('newFolder').value);return $('folderSelect').value}
+async function uploadOne(x,i,total){
+  const area=$('area').value; let rel;
+  if(area==='music') rel=x.file.name; // Music is intentionally flat: all MP3s in Cable82/music.
+  else {const folder=selectedFolder(); if(!folder)throw Error('Choose a channel folder or enter a new folder name'); rel=folder+'/'+x.path.replace(/^\/+/, '')}
+  const url='/api/upload?area='+encodeURIComponent(area)+'&path='+encodeURIComponent(rel); log('Uploading '+(i+1)+'/'+total+': '+rel);
+  const r=await fetch(url,{method:'PUT',body:x.file,headers:{'Content-Type':'application/octet-stream'}}); if(!r.ok)throw Error(await r.text()); log('✓ '+rel,'ok');
+}
+$('start').onclick=async()=>{if(busy||!chosen.length)return;if($('area').value==='channels'&&!selectedFolder()){alert('Choose an existing channel folder or enter a new folder name.');return}busy=true;$('log').textContent='';let ok=0,fail=0;for(let i=0;i<chosen.length;i++){try{await uploadOne(chosen[i],i,chosen.length);ok++}catch(e){fail++;log('✗ '+chosen[i].path+': '+e.message,'bad')} $('prog').style.width=((i+1)/chosen.length*100)+'%';$('status').textContent=(i+1)+' / '+chosen.length+' — '+ok+' OK, '+fail+' failed'}busy=false;log('Finished: '+ok+' uploaded, '+fail+' failed',fail?'bad':'ok');if($('area').value==='channels'&&ok)loadFolders()};
+loadFolders();
+</script></body></html>
